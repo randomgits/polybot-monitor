@@ -44,8 +44,8 @@ logs/
 models/
 *.zip
 
-# Data
-data/
+# Data (root level only, not src/polybot/data/)
+/data/
 *.db
 *.sqlite
 
