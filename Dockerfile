@@ -14,8 +14,8 @@ RUN apt-get update && apt-get install -y \
 COPY pyproject.toml .
 COPY src/ ./src/
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -e .
+# Install Python dependencies (non-editable for production)
+RUN pip install --no-cache-dir .
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
@@ -25,5 +25,5 @@ ENV PORT=8080
 # Expose port
 EXPOSE 8080
 
-# Run the API server
-CMD ["python", "-m", "uvicorn", "polybot.api:app", "--host", "0.0.0.0", "--port", "8080"]
+# Run the API server using shell form to expand $PORT
+CMD python -m uvicorn polybot.api:app --host 0.0.0.0 --port ${PORT:-8080}

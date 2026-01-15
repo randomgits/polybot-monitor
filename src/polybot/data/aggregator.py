@@ -307,7 +307,7 @@ class DataAggregator:
             "connections": {
                 "binance": self._binance.is_connected,
                 "chainlink": self._chainlink.is_connected,
-                "polymarket": self._polymarket._connected,
+                "polymarket": self._current_market is not None,  # True if we have market data
             },
             "opportunities_count": len(self._opportunities),
         }

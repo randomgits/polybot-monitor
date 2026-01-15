@@ -176,87 +176,107 @@ class PolymarketClient:
         """
         Discover active BTC 15-minute prediction markets.
 
+        BTC 15-min markets use timestamp-based slugs like 'btc-updown-15m-{timestamp}'
+        and must be queried directly - they don't appear in general market listings.
+
         Returns list of markets sorted by expiry time (soonest first).
         """
         if not self._http_client:
             await self.connect()
 
         markets = []
+        now = datetime.now(timezone.utc)
+        now_ts = int(now.timestamp())
 
-        try:
-            # Search for BTC 15-min markets via Gamma API
-            # Pattern: markets with "BTC" and "15" in the slug
-            response = await self._http_client.get(
-                f"{GAMMA_API_URL}/markets",
-                params={
-                    "closed": "false",
-                    "limit": 100,
-                }
-            )
-            response.raise_for_status()
-            data = clean_json_response(response.json())
+        # Calculate timestamps for current and upcoming 15-minute windows
+        interval = 15 * 60  # 15 minutes in seconds
+        current_window_end = ((now_ts // interval) + 1) * interval
 
-            now = datetime.now(timezone.utc)
+        # Check current and next few windows
+        timestamps_to_check = [
+            current_window_end,
+            current_window_end + interval,
+            current_window_end + interval * 2,
+        ]
 
-            for market_data in data:
-                # Filter for BTC 15-min markets
-                slug = market_data.get("slug", "")
-                question = market_data.get("question", "")
+        for ts in timestamps_to_check:
+            slug = f"btc-updown-15m-{ts}"
 
-                # Match patterns like "btc-updown-15m-*" or similar
-                is_btc_15m = (
-                    ("btc" in slug.lower() and "15m" in slug.lower()) or
-                    ("btc" in slug.lower() and "15-min" in slug.lower()) or
-                    ("bitcoin" in question.lower() and "15" in question.lower() and ("minute" in question.lower() or "min" in question.lower()))
+            try:
+                response = await self._http_client.get(
+                    f"{GAMMA_API_URL}/markets",
+                    params={"slug": slug}
                 )
+                response.raise_for_status()
+                data = clean_json_response(response.json())
 
-                if not is_btc_15m:
+                if not data:
                     continue
 
-                # Parse end time
-                end_time_str = market_data.get("endDateIso") or market_data.get("end_date_iso")
-                if not end_time_str:
-                    continue
+                # Handle both list and single object responses
+                market_list = data if isinstance(data, list) else [data]
 
-                try:
-                    end_time = datetime.fromisoformat(end_time_str.replace("Z", "+00:00"))
-                except (ValueError, AttributeError):
-                    continue
+                for market_data in market_list:
+                    question = market_data.get("question", "")
 
-                # Skip expired markets
-                if end_time <= now:
-                    continue
+                    # Parse end time - use endDate (full timestamp) not endDateIso (date only)
+                    end_time_str = market_data.get("endDate") or market_data.get("end_date")
+                    if not end_time_str:
+                        continue
 
-                # Get token IDs
-                clob_token_ids = market_data.get("clobTokenIds", [])
-                if not clob_token_ids or len(clob_token_ids) < 2:
-                    continue
+                    try:
+                        # Handle various datetime formats from API
+                        end_time_str_clean = end_time_str.replace("Z", "+00:00")
+                        end_time = datetime.fromisoformat(end_time_str_clean)
+                        # Ensure timezone-aware for comparison
+                        if end_time.tzinfo is None:
+                            end_time = end_time.replace(tzinfo=timezone.utc)
+                    except (ValueError, AttributeError):
+                        continue
 
-                # Parse prices
-                yes_price = float(market_data.get("outcomePrices", ["0.5", "0.5"])[0])
-                no_price = float(market_data.get("outcomePrices", ["0.5", "0.5"])[1])
+                    # Skip expired or closed markets
+                    if end_time <= now:
+                        continue
 
-                # Parse start price from question (e.g., "Will BTC be above $95,000...")
-                start_price = self._parse_strike_from_question(question)
+                    if market_data.get("closed"):
+                        continue
 
-                market = BTC15MinMarket(
-                    market_id=market_data.get("id", ""),
-                    condition_id=market_data.get("conditionId", ""),
-                    question=question,
-                    token_id=clob_token_ids[0],  # YES token
-                    no_token_id=clob_token_ids[1],  # NO token
-                    yes_price=yes_price,
-                    no_price=no_price,
-                    start_price=start_price,
-                    end_time=end_time,
-                    slug=slug,
-                )
-                markets.append(market)
+                    # Get token IDs
+                    clob_token_ids = market_data.get("clobTokenIds", [])
+                    if not clob_token_ids or len(clob_token_ids) < 2:
+                        continue
 
-        except httpx.HTTPError as e:
-            logger.error(f"[Polymarket] HTTP error fetching markets: {e}")
-        except Exception as e:
-            logger.error(f"[Polymarket] Error fetching markets: {e}")
+                    # Parse prices
+                    outcome_prices = market_data.get("outcomePrices", ["0.5", "0.5"])
+                    try:
+                        yes_price = float(outcome_prices[0]) if outcome_prices else 0.5
+                        no_price = float(outcome_prices[1]) if len(outcome_prices) > 1 else 0.5
+                    except (ValueError, TypeError):
+                        yes_price = 0.5
+                        no_price = 0.5
+
+                    # Parse start price from question
+                    start_price = self._parse_strike_from_question(question)
+
+                    market = BTC15MinMarket(
+                        market_id=str(market_data.get("id", "")),
+                        condition_id=str(market_data.get("conditionId", "")),
+                        question=question,
+                        token_id=str(clob_token_ids[0]),  # YES token
+                        no_token_id=str(clob_token_ids[1]),  # NO token
+                        yes_price=yes_price,
+                        no_price=no_price,
+                        start_price=start_price,
+                        end_time=end_time,
+                        slug=slug,
+                    )
+                    markets.append(market)
+                    logger.info(f"[Polymarket] Found market: {slug} expires at {end_time}")
+
+            except httpx.HTTPError as e:
+                logger.debug(f"[Polymarket] No market at {slug}: {e}")
+            except Exception as e:
+                logger.error(f"[Polymarket] Error fetching market {slug}: {e}")
 
         # Sort by expiry time (soonest first)
         markets.sort(key=lambda m: m.end_time)

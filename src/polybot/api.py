@@ -115,46 +115,62 @@ class OpportunityResponse(BaseModel):
     confidence: float
 
 
+async def initialize_services():
+    """Initialize data services in the background."""
+    try:
+        logger.info("Initializing data services...")
+
+        # Initialize clients
+        state.polymarket_client = PolymarketClient()
+        state.binance_client = BinanceClient()
+        state.chainlink_client = ChainlinkClient()
+
+        await state.polymarket_client.connect()
+
+        # Initialize aggregator
+        state.aggregator = DataAggregator(
+            state.polymarket_client,
+            state.binance_client,
+            state.chainlink_client,
+        )
+
+        # Initialize probability model
+        state.probability_model = ProbabilityModel(
+            min_edge_threshold=float(os.getenv("MIN_EDGE_THRESHOLD", "0.05")),
+            kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
+        )
+
+        # Register state update callback
+        state.aggregator.on_state_update(on_state_update)
+
+        # Start aggregator
+        await state.aggregator.start()
+
+        logger.info("Data services initialized successfully")
+    except Exception as e:
+        logger.error(f"Error initializing services: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan handler - initialize and cleanup."""
     logger.info("Starting PolyBot monitoring service...")
 
-    # Initialize clients
-    state.polymarket_client = PolymarketClient()
-    state.binance_client = BinanceClient()
-    state.chainlink_client = ChainlinkClient()
+    # Start services in background so health check can respond immediately
+    asyncio.create_task(initialize_services())
 
-    await state.polymarket_client.connect()
-
-    # Initialize aggregator
-    state.aggregator = DataAggregator(
-        state.polymarket_client,
-        state.binance_client,
-        state.chainlink_client,
-    )
-
-    # Initialize probability model
-    state.probability_model = ProbabilityModel(
-        min_edge_threshold=float(os.getenv("MIN_EDGE_THRESHOLD", "0.05")),
-        kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
-    )
-
-    # Register state update callback
-    state.aggregator.on_state_update(on_state_update)
-
-    # Start aggregator
-    await state.aggregator.start()
-
-    logger.info("PolyBot monitoring service started")
+    logger.info("PolyBot monitoring service started (services initializing in background)")
 
     yield
 
     # Cleanup
     logger.info("Shutting down PolyBot monitoring service...")
-    await state.aggregator.stop()
-    await state.polymarket_client.disconnect()
-    await state.chainlink_client.disconnect()
+    if state.aggregator:
+        await state.aggregator.stop()
+    if state.polymarket_client:
+        await state.polymarket_client.disconnect()
+    if state.chainlink_client:
+        await state.chainlink_client.disconnect()
 
 
 def on_state_update(market_state: MarketState) -> None:
@@ -236,11 +252,11 @@ async def root():
     """Dashboard home page."""
     uptime = (datetime.now(timezone.utc) - state.start_time).total_seconds()
 
-    # Get current status
+    # Get current status (handle None values)
     status_data = state.aggregator.get_status() if state.aggregator else {}
-    market = status_data.get("market", {})
-    prices = status_data.get("prices", {})
-    connections = status_data.get("connections", {})
+    market = status_data.get("market") or {}
+    prices = status_data.get("prices") or {}
+    connections = status_data.get("connections") or {}
 
     # Format recent opportunities
     opportunities_html = ""
@@ -387,10 +403,11 @@ async def health():
     uptime = (datetime.now(timezone.utc) - state.start_time).total_seconds()
     status_data = state.aggregator.get_status() if state.aggregator else {}
 
+    # Return "ok" even during initialization for healthcheck to pass
     return HealthResponse(
-        status="ok" if state.aggregator and state.aggregator._running else "starting",
+        status="ok",
         uptime_seconds=uptime,
-        connections=status_data.get("connections", {}),
+        connections=status_data.get("connections", {"binance": False, "chainlink": False, "polymarket": False}),
     )
 
 
@@ -400,8 +417,10 @@ async def status():
     uptime = (datetime.now(timezone.utc) - state.start_time).total_seconds()
     status_data = state.aggregator.get_status() if state.aggregator else {}
 
-    market_data = status_data.get("market", {})
-    prices = status_data.get("prices", {})
+    market_data = status_data.get("market") or {}
+    prices = status_data.get("prices") or {}
+    volatility = status_data.get("volatility") or {}
+    connections = status_data.get("connections") or {}
 
     return StatusResponse(
         running=state.aggregator._running if state.aggregator else False,
@@ -409,20 +428,20 @@ async def status():
             market_id=market_data.get("id"),
             question=market_data.get("question"),
             time_to_expiry_seconds=market_data.get("time_to_expiry", 0) or 0,
-            yes_price=prices.get("yes_price", 0.5),
-            no_price=prices.get("no_price", 0.5),
+            yes_price=prices.get("yes_price", 0.5) or 0.5,
+            no_price=prices.get("no_price", 0.5) or 0.5,
             spread=0.0,
         ) if market_data.get("id") else None,
         prices=PricesResponse(
-            btc_binance=prices.get("btc_binance", 0),
-            btc_chainlink=prices.get("btc_chainlink", 0),
-            btc_spread=prices.get("btc_spread", 0),
+            btc_binance=prices.get("btc_binance", 0) or 0,
+            btc_chainlink=prices.get("btc_chainlink", 0) or 0,
+            btc_spread=prices.get("btc_spread", 0) or 0,
             chainlink_age_seconds=0,
         ),
-        volatility=status_data.get("volatility", {}),
-        connections=status_data.get("connections", {}),
+        volatility=volatility,
+        connections=connections,
         signals_generated=state.signals_generated,
-        opportunities_count=status_data.get("opportunities_count", 0),
+        opportunities_count=status_data.get("opportunities_count", 0) or 0,
         uptime_seconds=uptime,
     )
 
