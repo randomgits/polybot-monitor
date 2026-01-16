@@ -5,17 +5,22 @@ Orchestrates:
 - Binance/exchange price feeds (real-time BTC prices)
 - Polymarket order books (prediction market odds)
 - Chainlink oracle (resolution source)
+- Position management for start price tracking
+- Paper trading for strategy validation
 """
 
 import asyncio
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable, Optional
 
 from polybot.data.models import MarketState, BTC15MinMarket, Opportunity
 from polybot.data.binance import BinanceClient, BinanceTick
 from polybot.data.polymarket import PolymarketClient, OrderBookUpdate
 from polybot.data.chainlink import ChainlinkClient, ChainlinkPriceUpdate
+from polybot.trading.position_manager import PositionManager
+from polybot.trading.paper_trader import PaperTrader
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +40,9 @@ class DataAggregator:
         polymarket_client: PolymarketClient,
         binance_client: BinanceClient,
         chainlink_client: ChainlinkClient,
+        enable_paper_trading: bool = True,
+        paper_trading_balance: float = 1000.0,
+        data_dir: Optional[Path] = None,
     ):
         self._polymarket = polymarket_client
         self._binance = binance_client
@@ -61,6 +69,21 @@ class DataAggregator:
         self._opportunities: list[Opportunity] = []
         self._max_opportunities = 100
 
+        # Position management for start price tracking
+        self._position_manager = PositionManager(data_dir=data_dir)
+
+        # Paper trading
+        self._enable_paper_trading = enable_paper_trading
+        self._paper_trader: Optional[PaperTrader] = None
+        if enable_paper_trading:
+            self._paper_trader = PaperTrader(
+                initial_balance=paper_trading_balance,
+                data_dir=data_dir,
+            )
+
+        # Track captured start price per market
+        self._market_start_prices: dict[str, float] = {}
+
     @property
     def current_market(self) -> Optional[BTC15MinMarket]:
         """Currently tracked market."""
@@ -75,6 +98,16 @@ class DataAggregator:
     def opportunities(self) -> list[Opportunity]:
         """Detected trading opportunities."""
         return self._opportunities
+
+    @property
+    def paper_trader(self) -> Optional[PaperTrader]:
+        """Paper trader instance."""
+        return self._paper_trader
+
+    @property
+    def position_manager(self) -> PositionManager:
+        """Position manager instance."""
+        return self._position_manager
 
     def on_state_update(self, callback: Callable[[MarketState], None]) -> None:
         """Register callback for state updates."""
@@ -151,6 +184,18 @@ class DataAggregator:
                 await self._polymarket.get_order_book(best_market.token_id)
                 await self._polymarket.get_order_book(best_market.no_token_id)
 
+                # Register market with position manager for start price tracking
+                if best_market.window_start:
+                    self._position_manager.track_market(
+                        market_id=best_market.market_id,
+                        slug=best_market.slug,
+                        question=best_market.question,
+                        window_start=best_market.window_start,
+                        window_end=best_market.end_time,
+                        yes_token_id=best_market.token_id,
+                        no_token_id=best_market.no_token_id,
+                    )
+
                 logger.info(
                     f"[Aggregator] Tracking market: {best_market.question[:50]}... "
                     f"(expires in {best_market.time_to_expiry_seconds:.0f}s)"
@@ -184,6 +229,22 @@ class DataAggregator:
                     break
 
                 self._btc_price_chainlink = update.price
+
+                # Record price for start price capture
+                self._position_manager.record_price(update.price)
+
+                # Try to capture start price for current market
+                if self._current_market:
+                    captured = self._position_manager.try_capture_start_price(
+                        self._current_market.market_id,
+                        update.price,
+                    )
+                    if captured and self._current_market.market_id not in self._market_start_prices:
+                        self._market_start_prices[self._current_market.market_id] = captured
+                        logger.info(
+                            f"[Aggregator] Captured start price for market: ${captured:,.2f}"
+                        )
+
                 self._update_state()
 
         except asyncio.CancelledError:
@@ -252,6 +313,15 @@ class DataAggregator:
         # Get Polymarket spread
         pm_spread = self._polymarket.get_spread()
 
+        # Get start price - prioritize captured price from position manager
+        market_id = self._current_market.market_id
+        start_price = (
+            self._market_start_prices.get(market_id)  # Captured at window start
+            or self._position_manager.get_start_price(market_id)  # From position manager
+            or self._current_market.start_price  # From API
+            or self._btc_price_chainlink  # Fallback
+        )
+
         # Build state
         state = MarketState(
             timestamp=datetime.now(timezone.utc),
@@ -261,7 +331,7 @@ class DataAggregator:
             polymarket_no_price=self._polymarket_no_price,
             polymarket_spread=pm_spread,
             time_to_expiry=self._current_market.time_to_expiry_seconds,
-            market_start_price=self._current_market.start_price or self._btc_price_chainlink,
+            market_start_price=start_price,
             volatility_1m=vol_1m,
             volatility_5m=vol_5m,
             volatility_15m=vol_15m,
@@ -285,12 +355,24 @@ class DataAggregator:
 
     def get_status(self) -> dict:
         """Get current aggregator status."""
+        # Get captured start price for current market
+        start_price = None
+        if self._current_market:
+            market_id = self._current_market.market_id
+            start_price = (
+                self._market_start_prices.get(market_id)
+                or self._position_manager.get_start_price(market_id)
+                or self._current_market.start_price
+            )
+
         return {
             "running": self._running,
             "market": {
                 "id": self._current_market.market_id if self._current_market else None,
                 "question": self._current_market.question[:50] if self._current_market else None,
                 "time_to_expiry": self._current_market.time_to_expiry_seconds if self._current_market else None,
+                "start_price": start_price,
+                "window_started": self._current_market.is_window_started if self._current_market else None,
             } if self._current_market else None,
             "prices": {
                 "btc_binance": self._btc_price_binance,
@@ -307,7 +389,9 @@ class DataAggregator:
             "connections": {
                 "binance": self._binance.is_connected,
                 "chainlink": self._chainlink.is_connected,
-                "polymarket": self._current_market is not None,  # True if we have market data
+                "polymarket": self._current_market is not None,
             },
             "opportunities_count": len(self._opportunities),
+            "paper_trading": self._paper_trader.get_stats() if self._paper_trader else None,
+            "position_manager": self._position_manager.get_status(),
         }

@@ -255,8 +255,20 @@ class PolymarketClient:
                         yes_price = 0.5
                         no_price = 0.5
 
-                    # Parse start price from question
+                    # Parse start price from question (fallback only)
                     start_price = self._parse_strike_from_question(question)
+
+                    # Parse window start time (eventStartTime)
+                    window_start = None
+                    window_start_str = market_data.get("eventStartTime")
+                    if window_start_str:
+                        try:
+                            window_start_clean = window_start_str.replace("Z", "+00:00")
+                            window_start = datetime.fromisoformat(window_start_clean)
+                            if window_start.tzinfo is None:
+                                window_start = window_start.replace(tzinfo=timezone.utc)
+                        except (ValueError, AttributeError):
+                            pass
 
                     market = BTC15MinMarket(
                         market_id=str(market_data.get("id", "")),
@@ -268,6 +280,7 @@ class PolymarketClient:
                         no_price=no_price,
                         start_price=start_price,
                         end_time=end_time,
+                        window_start=window_start,
                         slug=slug,
                     )
                     markets.append(market)

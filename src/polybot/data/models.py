@@ -30,8 +30,9 @@ class BTC15MinMarket:
     no_token_id: str  # NO token ID
     yes_price: float
     no_price: float
-    start_price: float  # BTC price at market open
-    end_time: datetime
+    start_price: float  # BTC price at market open (captured at window_start)
+    end_time: datetime  # When market resolves (window end)
+    window_start: Optional[datetime] = None  # When 15-min window starts (eventStartTime)
     slug: str = ""
 
     @property
@@ -39,6 +40,21 @@ class BTC15MinMarket:
         """Seconds until market resolution."""
         delta = self.end_time - datetime.now(timezone.utc)
         return max(0, delta.total_seconds())
+
+    @property
+    def time_to_window_start(self) -> float:
+        """Seconds until window starts (when we capture start price)."""
+        if not self.window_start:
+            return 0.0
+        delta = self.window_start - datetime.now(timezone.utc)
+        return max(0, delta.total_seconds())
+
+    @property
+    def is_window_started(self) -> bool:
+        """Whether the 15-min window has started."""
+        if not self.window_start:
+            return True  # Assume started if no window_start
+        return datetime.now(timezone.utc) >= self.window_start
 
     @property
     def spread(self) -> float:

@@ -127,11 +127,16 @@ async def initialize_services():
 
         await state.polymarket_client.connect()
 
-        # Initialize aggregator
+        # Initialize aggregator with paper trading
+        enable_paper_trading = os.getenv("ENABLE_PAPER_TRADING", "true").lower() == "true"
+        paper_trading_balance = float(os.getenv("PAPER_TRADING_BALANCE", "1000.0"))
+
         state.aggregator = DataAggregator(
             state.polymarket_client,
             state.binance_client,
             state.chainlink_client,
+            enable_paper_trading=enable_paper_trading,
+            paper_trading_balance=paper_trading_balance,
         )
 
         # Initialize probability model
@@ -228,6 +233,26 @@ def on_state_update(market_state: MarketState) -> None:
 
         state.aggregator.record_opportunity(opportunity)
 
+        # Paper trade if conditions are met
+        if state.aggregator.paper_trader and signal.recommended_action != "HOLD":
+            trade_result = state.aggregator.paper_trader.execute_trade(
+                market_id=market_state.market_id,
+                action=signal.recommended_action,
+                probability=signal.model_up_probability,
+                edge=signal.edge,
+                confidence=signal.confidence,
+                kelly_fraction=signal.kelly_fraction,
+                yes_price=market_state.polymarket_yes_price,
+                no_price=market_state.polymarket_no_price,
+                time_to_expiry=market_state.time_to_expiry,
+                spread=market_state.polymarket_spread,
+            )
+            if trade_result:
+                logger.info(
+                    f"[PaperTrade] {trade_result.action} - size: ${trade_result.size:.2f}, "
+                    f"price: {trade_result.entry_price:.3f}"
+                )
+
 
 # Create FastAPI app
 app = FastAPI(
@@ -245,6 +270,40 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def generate_paper_trading_html() -> str:
+    """Generate HTML for paper trading stats."""
+    if not state.aggregator or not state.aggregator.paper_trader:
+        return '<p style="color: #888;">Paper trading not enabled</p>'
+
+    stats = state.aggregator.paper_trader.get_stats()
+    pnl = stats.get("total_pnl", 0)
+    pnl_color = "#4caf50" if pnl >= 0 else "#f44336"
+
+    return f"""
+    <div class="grid">
+        <div class="stat">
+            <div class="stat-value" style="color: {pnl_color};">${pnl:+.2f}</div>
+            <div class="stat-label">Total P&L</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">{stats.get('win_rate', 0):.1f}%</div>
+            <div class="stat-label">Win Rate</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">{stats.get('total_trades', 0)}</div>
+            <div class="stat-label">Total Trades</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">${stats.get('balance', 0):,.2f}</div>
+            <div class="stat-label">Balance</div>
+        </div>
+    </div>
+    <p style="color: #888; font-size: 12px;">
+        Wins: {stats.get('wins', 0)} | Losses: {stats.get('losses', 0)} | Open: {stats.get('open_positions', 0)}
+    </p>
+    """
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -378,12 +437,19 @@ async def root():
         </div>
 
         <div class="card">
+            <h2>Paper Trading</h2>
+            {generate_paper_trading_html()}
+        </div>
+
+        <div class="card">
             <h2>API Endpoints</h2>
             <ul>
                 <li><a href="/health" style="color: #00d4ff;">/health</a> - Health check</li>
                 <li><a href="/status" style="color: #00d4ff;">/status</a> - Full status</li>
                 <li><a href="/opportunities" style="color: #00d4ff;">/opportunities</a> - Recent opportunities</li>
                 <li><a href="/signals" style="color: #00d4ff;">/signals</a> - Recent signals</li>
+                <li><a href="/trading/stats" style="color: #00d4ff;">/trading/stats</a> - Paper trading stats</li>
+                <li><a href="/trading/trades" style="color: #00d4ff;">/trading/trades</a> - Recent paper trades</li>
                 <li><a href="/docs" style="color: #00d4ff;">/docs</a> - API documentation</li>
             </ul>
         </div>
@@ -509,6 +575,64 @@ async def current_signal():
         "kelly_fraction": signal.kelly_fraction,
         "should_trade": signal.recommended_action != "HOLD",
     }
+
+
+# ==================== Trading Endpoints ====================
+
+@app.get("/trading/stats")
+async def trading_stats():
+    """Get paper trading statistics."""
+    if not state.aggregator or not state.aggregator.paper_trader:
+        return {"enabled": False, "message": "Paper trading not enabled"}
+
+    return {
+        "enabled": True,
+        "stats": state.aggregator.paper_trader.get_stats(),
+    }
+
+
+@app.get("/trading/trades")
+async def trading_trades():
+    """Get recent paper trades."""
+    if not state.aggregator or not state.aggregator.paper_trader:
+        return {"enabled": False, "trades": []}
+
+    return {
+        "enabled": True,
+        "count": len(state.aggregator.paper_trader.trades),
+        "trades": [t.to_dict() for t in reversed(state.aggregator.paper_trader.trades[-50:])],
+    }
+
+
+@app.get("/trading/positions")
+async def trading_positions():
+    """Get position manager status and market windows."""
+    if not state.aggregator:
+        return {"windows": []}
+
+    return state.aggregator.position_manager.get_status()
+
+
+@app.get("/trading/full")
+async def trading_full():
+    """Get complete trading status including paper trades and positions."""
+    if not state.aggregator:
+        return {"error": "Aggregator not initialized"}
+
+    result = {
+        "paper_trading": {
+            "enabled": state.aggregator.paper_trader is not None,
+        },
+        "position_manager": state.aggregator.position_manager.get_status(),
+    }
+
+    if state.aggregator.paper_trader:
+        result["paper_trading"]["stats"] = state.aggregator.paper_trader.get_stats()
+        result["paper_trading"]["recent_trades"] = [
+            t.to_dict() for t in reversed(state.aggregator.paper_trader.trades[-10:])
+        ]
+
+    return result
 
 
 # Entry point for running directly
