@@ -562,7 +562,8 @@ async def current_signal():
     if not state.aggregator or not state.aggregator.current_state or not state.probability_model:
         raise HTTPException(status_code=404, detail="No current state")
 
-    signal = state.probability_model.generate_signal(state.aggregator.current_state)
+    current_state = state.aggregator.current_state
+    signal = state.probability_model.generate_signal(current_state)
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -574,6 +575,15 @@ async def current_signal():
         "confidence": signal.confidence,
         "kelly_fraction": signal.kelly_fraction,
         "should_trade": signal.recommended_action != "HOLD",
+        # Debug fields
+        "debug": {
+            "polymarket_spread": current_state.polymarket_spread,
+            "time_to_expiry": current_state.time_to_expiry,
+            "market_start_price": current_state.market_start_price,
+            "btc_chainlink": current_state.btc_price_chainlink,
+            "yes_price": current_state.polymarket_yes_price,
+            "no_price": current_state.polymarket_no_price,
+        }
     }
 
 
