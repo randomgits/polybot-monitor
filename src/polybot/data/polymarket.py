@@ -345,10 +345,12 @@ class PolymarketClient:
             bids = data.get("bids", [])
             asks = data.get("asks", [])
 
-            best_bid = float(bids[0]["price"]) if bids else 0.0
-            best_ask = float(asks[0]["price"]) if asks else 1.0
-            bid_size = float(bids[0]["size"]) if bids else 0.0
-            ask_size = float(asks[0]["size"]) if asks else 0.0
+            # Bids sorted ascending (low to high), so best bid is LAST
+            # Asks sorted descending (high to low), so best ask is LAST
+            best_bid = float(bids[-1]["price"]) if bids else 0.0
+            best_ask = float(asks[-1]["price"]) if asks else 1.0
+            bid_size = float(bids[-1]["size"]) if bids else 0.0
+            ask_size = float(asks[-1]["size"]) if asks else 0.0
 
             update = OrderBookUpdate(
                 token_id=token_id,
@@ -418,10 +420,12 @@ class PolymarketClient:
                             bids = msg.get("bids", [])
                             asks = msg.get("asks", [])
 
-                            best_bid = float(bids[0]["price"]) if bids else 0.0
-                            best_ask = float(asks[0]["price"]) if asks else 1.0
-                            bid_size = float(bids[0]["size"]) if bids else 0.0
-                            ask_size = float(asks[0]["size"]) if asks else 0.0
+                            # Bids sorted ascending, asks sorted descending
+                            # Best bid = highest bid (last), Best ask = lowest ask (last)
+                            best_bid = float(bids[-1]["price"]) if bids else 0.0
+                            best_ask = float(asks[-1]["price"]) if asks else 1.0
+                            bid_size = float(bids[-1]["size"]) if bids else 0.0
+                            ask_size = float(asks[-1]["size"]) if asks else 0.0
 
                             update = OrderBookUpdate(
                                 token_id=token_id,
