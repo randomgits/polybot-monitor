@@ -131,12 +131,19 @@ async def initialize_services():
         enable_paper_trading = os.getenv("ENABLE_PAPER_TRADING", "true").lower() == "true"
         paper_trading_balance = float(os.getenv("PAPER_TRADING_BALANCE", "1000.0"))
 
+        # Data directory for persistent storage (default: /tmp)
+        # Set DATA_DIR env var to use a Railway Volume or other persistent storage
+        data_dir_path = os.getenv("DATA_DIR")
+        from pathlib import Path
+        data_dir = Path(data_dir_path) if data_dir_path else None
+
         state.aggregator = DataAggregator(
             state.polymarket_client,
             state.binance_client,
             state.chainlink_client,
             enable_paper_trading=enable_paper_trading,
             paper_trading_balance=paper_trading_balance,
+            data_dir=data_dir,
         )
 
         # Initialize probability model
@@ -235,9 +242,24 @@ def on_state_update(market_state: MarketState) -> None:
 
         # Paper trade if conditions are met
         if state.aggregator.paper_trader and signal.recommended_action != "HOLD":
+            # Get market question for logging
+            market_question = ""
+            if state.aggregator.current_market:
+                market_question = state.aggregator.current_market.question
+
+            # Contrarian mode: flip the signal (bet opposite to model)
+            action = signal.recommended_action
+            contrarian_mode = os.getenv("CONTRARIAN_MODE", "false").lower() == "true"
+            if contrarian_mode:
+                if action == "BUY_YES":
+                    action = "BUY_NO"
+                elif action == "BUY_NO":
+                    action = "BUY_YES"
+                logger.info(f"[Contrarian] Flipped {signal.recommended_action} → {action}")
+
             trade_result = state.aggregator.paper_trader.execute_trade(
                 market_id=market_state.market_id,
-                action=signal.recommended_action,
+                action=action,
                 probability=signal.model_up_probability,
                 edge=signal.edge,
                 confidence=signal.confidence,
@@ -246,12 +268,83 @@ def on_state_update(market_state: MarketState) -> None:
                 no_price=market_state.polymarket_no_price,
                 time_to_expiry=market_state.time_to_expiry,
                 spread=market_state.polymarket_spread,
+                market_question=market_question,
+                btc_chainlink=market_state.btc_price_chainlink,
+                btc_start_price=market_state.market_start_price,
             )
             if trade_result:
                 logger.info(
-                    f"[PaperTrade] {trade_result.action} - size: ${trade_result.size:.2f}, "
+                    f"[PaperTrade] {trade_result.entry_side} - size: ${trade_result.size_usd:.2f}, "
                     f"price: {trade_result.entry_price:.3f}"
                 )
+
+    # Close paper trades for expired markets (always check, not just on 5%+ edge)
+    if state.aggregator.paper_trader:
+        _resolve_expired_trades(market_state)
+
+
+def _resolve_expired_trades(market_state: MarketState) -> None:
+    """
+    Resolve paper trades when markets expire.
+
+    Checks for open trades in expired markets and closes them based on
+    the final BTC price vs start price.
+    """
+    if not state.aggregator or not state.aggregator.paper_trader:
+        return
+
+    paper_trader = state.aggregator.paper_trader
+    open_trades = paper_trader.get_open_positions()
+
+    if not open_trades:
+        return
+
+    # Get current Chainlink price (resolution source)
+    final_btc_price = market_state.btc_price_chainlink
+    current_market_id = market_state.market_id
+
+    for trade in open_trades:
+        # Check if market expired (time_to_expiry <= 0)
+        # Since we only track one market at a time, check if this trade's market
+        # is different from current market (meaning old market expired)
+        is_old_market = trade.market_id != current_market_id
+
+        # Or if same market but expired
+        is_expired = market_state.time_to_expiry <= 0
+
+        logger.debug(
+            f"[Resolution] Trade {trade.trade_id}: market={trade.market_id}, "
+            f"current={current_market_id}, is_old={is_old_market}, is_expired={is_expired}"
+        )
+
+        if is_old_market or is_expired:
+            # Resolve the trade
+            start_price = trade.btc_start_price
+
+            # If we don't have start price, try to get it from position manager
+            if not start_price and state.aggregator.position_manager:
+                start_price = state.aggregator.position_manager.get_start_price(trade.market_id) or 0
+
+            # If still no start price, use the entry chainlink price as fallback
+            if not start_price:
+                start_price = trade.btc_chainlink_at_entry
+
+            if start_price > 0:
+                closed = paper_trader.close_trade(
+                    market_id=trade.market_id,
+                    final_btc_price=final_btc_price,
+                    btc_start_price=start_price,
+                )
+                if closed:
+                    logger.info(
+                        f"[PaperTrade] Resolved: {closed.outcome} "
+                        f"(start: ${start_price:,.2f}, final: ${final_btc_price:,.2f}, "
+                        f"P&L: ${closed.pnl:+.2f})"
+                    )
+            else:
+                # Can't resolve without start price, expire the trade
+                paper_trader.expire_trade(trade.market_id)
+                logger.warning(f"[PaperTrade] Expired trade {trade.trade_id} - no start price")
 
 
 # Create FastAPI app
@@ -643,6 +736,20 @@ async def trading_full():
         ]
 
     return result
+
+
+@app.post("/trading/reset")
+async def trading_reset():
+    """Reset paper trading state (for testing)."""
+    if not state.aggregator or not state.aggregator.paper_trader:
+        return {"error": "Paper trading not enabled"}
+
+    state.aggregator.paper_trader.reset()
+    return {
+        "success": True,
+        "message": "Paper trading state reset",
+        "stats": state.aggregator.paper_trader.get_stats(),
+    }
 
 
 # Entry point for running directly

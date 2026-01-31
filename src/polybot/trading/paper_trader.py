@@ -462,6 +462,14 @@ class PaperTrader:
             logger.warning(f"[PaperTrader] Unknown action: {action}")
             return None
 
+        # Price sanity check - skip illiquid/extreme order books
+        # If price < 0.10 or > 0.90, market is too one-sided (thin liquidity)
+        if price < 0.10 or price > 0.90:
+            logger.debug(
+                f"[PaperTrader] Skipping trade - price {price:.3f} indicates thin liquidity"
+            )
+            return None
+
         # Check if we should trade
         if not self.should_trade(edge, confidence, time_to_expiry, spread, market_id):
             return None

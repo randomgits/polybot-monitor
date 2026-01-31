@@ -32,6 +32,8 @@ CLOB_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 def get_proxy_url() -> Optional[str]:
     """Get HTTP proxy URL for Polymarket API."""
+    from urllib.parse import quote
+
     proxy_host = os.getenv("PROXY_HOST", "")
     proxy_port = os.getenv("PROXY_PORT", "")
     proxy_user = os.getenv("PROXY_USER", "")
@@ -41,7 +43,9 @@ def get_proxy_url() -> Optional[str]:
         return None
 
     if proxy_user and proxy_pass:
-        return f"http://{proxy_user}:{proxy_pass}@{proxy_host}:{proxy_port}"
+        # URL-encode the password to handle special characters like ~
+        encoded_pass = quote(proxy_pass, safe='')
+        return f"http://{proxy_user}:{encoded_pass}@{proxy_host}:{proxy_port}"
     return f"http://{proxy_host}:{proxy_port}"
 
 
